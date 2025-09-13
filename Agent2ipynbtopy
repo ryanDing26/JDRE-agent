@@ -1,0 +1,430 @@
+# %%
+%pip install faiss-cpu sentence-transformers pandas tqdm
+%pip install biopython
+%pip install datasets
+%pip install tabulate
+
+# %%
+from Bio import Entrez
+from time import sleep
+from datasets import Dataset
+import pandas as pd
+import os
+import re
+from transformers import BertTokenizer
+import random
+from transformers import DataCollatorForLanguageModeling
+from transformers import BertForMaskedLM
+from transformers import TrainingArguments, Trainer
+
+# %%
+Entrez.email = "edisonzjy@gmail.com"
+search_term = "biomedical research"
+max_articles = 10000
+batch_size = 100
+
+output_file = "pubmed_abstracts.txt"
+
+def fetch_pubmed_abstracts():
+    print(f"Searching PubMed for: {search_term}")
+    search_handle = Entrez.esearch(db="pubmed", term=search_term, retmax=max_articles)
+    record = Entrez.read(search_handle)
+    search_handle.close()
+
+    pmids = record["IdList"]
+    print(f"Found {len(pmids)} articles.")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        for start in range(0, len(pmids), batch_size):
+            end = min(start + batch_size, len(pmids))
+            batch_pmids = pmids[start:end]
+            print(f"Fetching batch: {start + 1}–{end}")
+            try:
+                handle = Entrez.efetch(
+                    db="pubmed",
+                    id=",".join(batch_pmids),
+                    rettype="abstract",
+                    retmode="text"
+                )
+                data = handle.read()
+                handle.close()
+
+                articles = []
+                raw_entries = data.split("\n\n")
+                for entry in raw_entries:
+                    match = re.search(r"(?:\n\n)?(?:[A-Z].+?\.){2,}", entry, re.DOTALL)
+                    if match:
+                        cleaned = match.group().strip().replace("\n", " ")
+                        articles.append(cleaned)
+                for article in articles:
+                    f.write(article + "\n")
+
+                sleep(0.5)
+            except Exception as e:
+                print(f"Error fetching batch {start + 1}–{end}: {e}")
+                sleep(2)
+
+    print(f"\nDone. Saved clean abstracts to: {output_file}")
+
+if __name__ == "__main__":
+    fetch_pubmed_abstracts()
+
+# %%
+"""
+Agentic RAG pipeline that handles:
+ - MIMIC NOTEEVENTS (filtered by clinical regex queries)
+ - PubMed abstracts (one abstract per line)
+ - Dual embeddings: SBERT (text) + CLIP (text via transformers)
+ - Two FAISS retrieval spaces: one for MIMIC, one for PubMed
+ - Agentic loop (retrieve -> reflect -> re-retrieve -> answer)
+ - CLI-style readable output and CSV exports with evaluation metrics
+"""
+
+import os
+import re
+import pandas as pd
+import numpy as np
+import faiss
+import torch
+from typing import List, Dict, Tuple
+from sentence_transformers import SentenceTransformer
+from transformers import CLIPTokenizer, CLIPTextModel, pipeline, AutoTokenizer, AutoModelForCausalLM
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+MIMIC_CSV = "NOTEEVENTS.csv"
+PUBMED_FILE = "pubmed_abstracts.txt"
+OUTPUT_DIR = "rag_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+PRIMARY_MODEL = "all-MiniLM-L6-v2"
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt2")
+
+TOP_K = 5
+AGENT_ITERS = 2
+BATCH_SIZE = 64
+CLIP_MAX_LEN = 77
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---------------------------
+# Regex queries
+# ---------------------------
+QUERIES = {
+    "Sepsis + Intubated + DNR": (
+        r"\bsepsis\b",
+        r"\b(?:intubated|mechanical ventilation|intubation)\b",
+        r"\b(?:do not resuscitate|dnr)\b"
+    ),
+    "AKI + Dialysis": (
+        r"\b(?:acute kidney injury|AKI)\b",
+        r"\b(?:hemodialysis|CRRT|dialysis)\b"
+    ),
+    "Diabetes + Hypoglycemia + Dextrose": (
+        r"\b(?:diabetes|diabetic)\b",
+        r"\b(?:hypoglycemia|low blood sugar)\b",
+        r"\b(?:dextrose|D50|glucose administration)\b"
+    ),
+    "Pneumonia + Antibiotics + Respiratory Failure": (
+        r"\b(?:pneumonia)\b",
+        r"\b(?:antibiotics|ceftriaxone|azithromycin|vancomycin)\b",
+        r"\b(?:respiratory failure|intubated|mechanical ventilation)\b"
+    ),
+    "Stroke + Neurological Deficit + CT Scan": (
+        r"\b(?:stroke|CVA|cerebrovascular accident)\b",
+        r"\b(?:hemiparesis|aphasia|slurred speech|neurological deficit)\b",
+        r"\b(?:CT scan|head CT|non-contrast CT)\b"
+    ),
+}
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def pretty_print_match(meta: Dict, text: str, score: float, snippet_len: int = 250):
+    """Pretty-print retrieval hits in CLI style (short & readable)."""
+    src = meta.get("source", "unknown")
+    sid = meta.get("subject_id", "")
+    hadm = meta.get("hadm_id", "")
+    date = meta.get("date", "")
+    snippet = text[:snippet_len].replace("\n", " ")
+    print(f" [{src}] subj={sid} hadm={hadm} date={date} | score={score:.3f}")
+    print(f"    -> {snippet}{'...' if len(text) > snippet_len else ''}")
+
+# ---------------------------
+# Data loading
+# ---------------------------
+def load_mimic_notes(path: str, usecols=None, nrows=None) -> pd.DataFrame:
+    if usecols is None:
+        usecols = ['ROW_ID', 'SUBJECT_ID', 'HADM_ID', 'CHARTDATE', 'CATEGORY', 'DESCRIPTION', 'TEXT']
+    df = pd.read_csv(path, usecols=usecols, dtype={'SUBJECT_ID': str, 'HADM_ID': str},
+                     engine="python", on_bad_lines="skip", nrows=nrows)
+    df['CHARTDATE'] = pd.to_datetime(df['CHARTDATE'], errors='coerce')
+    df['TEXT'] = df['TEXT'].fillna("").astype(str)
+    return df
+
+def load_pubmed_abstracts(path: str) -> List[str]:
+    docs = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                docs.append(line)
+    return docs
+
+# ---------------------------
+# Collect documents
+# ---------------------------
+def collect_mimic_documents(mimic_df: pd.DataFrame) -> Tuple[List[str], List[Dict]]:
+    docs, metas = [], []
+    for qname, patterns in QUERIES.items():
+        mask = pd.Series([True] * len(mimic_df))
+        for p in patterns:
+            mask &= mimic_df['TEXT'].str.contains(p, case=False, na=False, regex=True)
+        matched = mimic_df.loc[mask, ['ROW_ID', 'SUBJECT_ID', 'HADM_ID', 'CHARTDATE', 'TEXT']]
+        for _, row in matched.iterrows():
+            docs.append(row['TEXT'])
+            metas.append({
+                "source": "mimic",
+                "query_label": qname,
+                "row_id": row['ROW_ID'],
+                "subject_id": row['SUBJECT_ID'],
+                "hadm_id": row['HADM_ID'],
+                "date": (row['CHARTDATE'].date() if pd.notnull(row['CHARTDATE']) else "")
+            })
+    return docs, metas
+
+def collect_pubmed_documents(pubmed_docs: List[str]) -> Tuple[List[str], List[Dict]]:
+    docs, metas = [], []
+    for i, abstract in enumerate(pubmed_docs):
+        docs.append(abstract)
+        metas.append({
+            "source": "pubmed",
+            "query_label": "pubmed",
+            "row_id": f"pubmed_{i}",
+            "subject_id": "",
+            "hadm_id": "",
+            "date": ""
+        })
+    return docs, metas
+
+# ---------------------------
+# Embedding helpers
+# ---------------------------
+def batch_encode_sbert(model: SentenceTransformer, texts: List[str], batch_size: int = 64) -> np.ndarray:
+    embs = model.encode(texts, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True)
+    faiss.normalize_L2(embs)
+    return embs
+
+def batch_encode_clip(clip_tokenizer: CLIPTokenizer, clip_model: CLIPTextModel, texts: List[str],
+                      batch_size: int = 32, max_length: int = CLIP_MAX_LEN, device=DEVICE) -> np.ndarray:
+    clip_model.to(device)
+    all_embs = []
+    clip_model.eval()
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            toks = clip_tokenizer(batch, truncation=True, padding="max_length",
+                                  max_length=max_length, return_tensors="pt")
+            toks = {k: v.to(device) for k, v in toks.items()}
+            out = clip_model(**toks)
+            emb = out.last_hidden_state[:, 0, :].cpu().numpy()
+            all_embs.append(emb)
+    embs = np.vstack(all_embs)
+    faiss.normalize_L2(embs)
+    return embs
+
+# ---------------------------
+# Build FAISS index for one collection
+# ---------------------------
+def build_index_for_collection(text_model, clip_tokenizer, clip_model, docs):
+    sbert_embs = batch_encode_sbert(text_model, docs, batch_size=BATCH_SIZE)
+    clip_embs = batch_encode_clip(clip_tokenizer, clip_model, docs, batch_size=min(32, BATCH_SIZE))
+    combined = np.concatenate([sbert_embs, clip_embs], axis=1)
+    faiss.normalize_L2(combined)
+    dim = combined.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(combined.astype(np.float32))
+    return index, combined
+
+# ---------------------------
+# LLM generation
+# ---------------------------
+def llm_generate_answer(llm_name: str, prompt: str, device=DEVICE, max_length: int = 200) -> str:
+    try:
+        tok = AutoTokenizer.from_pretrained(llm_name)
+        model = AutoModelForCausalLM.from_pretrained(llm_name).to(device)
+        gen = pipeline("text-generation", model=model, tokenizer=tok, device=0 if device=="cuda" else -1)
+        out = gen(prompt, max_length=max_length, do_sample=False)
+        text = out[0]["generated_text"]
+        if prompt in text:
+            return text[len(prompt):].strip()
+        return text.strip()
+    except Exception:
+        return "⚠️ LLM not available — fallback summary:\n" + prompt[:1000]
+
+# ---------------------------
+# Agentic RAG loop
+# ---------------------------
+def agentic_rag_loop(query_label: str,
+                      query_text: str,
+                      index: faiss.Index,
+                      docs: List[str],
+                      metas: List[Dict],
+                      text_model: SentenceTransformer,
+                      clip_tokenizer: CLIPTokenizer,
+                      clip_model: CLIPTextModel,
+                      top_k: int = TOP_K,
+                      iterations: int = AGENT_ITERS,
+                      llm_name: str = LLM_MODEL_NAME) -> Dict:
+
+    state_query = query_text
+    retrieved_history = []
+
+    for it in range(iterations):
+        # Embed query
+        q_text_emb = text_model.encode([state_query], convert_to_numpy=True)
+        q_clip_emb = batch_encode_clip(clip_tokenizer, clip_model, [state_query], batch_size=1)
+        q_combined = np.concatenate([q_text_emb, q_clip_emb], axis=1).astype(np.float32)
+        faiss.normalize_L2(q_combined)
+
+        # Search
+        D, I = index.search(q_combined, top_k)
+        scores, ids = D[0], I[0]
+        retrieved = []
+        for rank, doc_idx in enumerate(ids, start=1):
+            meta = metas[doc_idx]
+            doctext = docs[doc_idx]
+            retrieved.append({
+                "rank": rank,
+                "score": float(scores[rank-1]),
+                "meta": meta,
+                "text": doctext
+            })
+        retrieved_history.append(retrieved)
+
+        # CLI output
+        print(f"\n[Agent Iter {it+1}] Query: {state_query}")
+        for r in retrieved:
+            pretty_print_match(r['meta'], r['text'], r['score'])
+
+        # Update query
+        best_score = retrieved[0]["score"] if retrieved else -1.0
+        if it < iterations - 1:
+            if best_score < 0.15:
+                state_query = query_text + " clinical findings, summary, main interventions"
+                print(" -> Low confidence; broadening query.")
+            else:
+                top_text = retrieved[0]['text'] if retrieved else ""
+                snippet = top_text[:200].replace("\n", " ")
+                state_query = f"{query_text} Context: {snippet}"
+                print(" -> Refining query using snippet.")
+
+    # Evaluation metrics
+    final_retrieved = retrieved_history[-1]
+    mean_score = np.mean([r['score'] for r in final_retrieved]) if final_retrieved else 0
+    best_score = max([r['score'] for r in final_retrieved]) if final_retrieved else 0
+    unique_sources = len(set([r['meta'].get('row_id') for r in final_retrieved]))
+
+    metrics = {
+        "mean_score": float(mean_score),
+        "best_score": float(best_score),
+        "unique_docs": unique_sources,
+        "n_retrieved": len(final_retrieved)
+    }
+
+    # LLM synthesis
+    prompt = f"Task: Answer the clinical query: {query_text}\n\nRetrieved context:\n"
+    for r in final_retrieved:
+        prompt += f"- Source: {r['meta'].get('source')} | score={r['score']:.3f}\n"
+        prompt += r['text'][:500] + "\n\n"
+    prompt += "\nAnswer concisely (3-6 sentences):\n"
+    answer = llm_generate_answer(llm_name, prompt, device=DEVICE, max_length=300)
+
+    return {
+        "query_label": query_label,
+        "original_query": query_text,
+        "retrieved": final_retrieved,
+        "answer": answer,
+        "metrics": metrics,
+        "prompt_used": prompt
+    }
+
+# ---------------------------
+# Save results
+# ---------------------------
+def save_results_to_csv(result: Dict, out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    qlabel = result['query_label'].replace(" ", "_").replace("+", "")
+    fname = os.path.join(out_dir, f"results_{qlabel}.csv")
+    rows = []
+    for r in result['retrieved']:
+        meta = r['meta']
+        rows.append({
+            "query_label": result['query_label'],
+            "original_query": result['original_query'],
+            "rank": r['rank'],
+            "score": r['score'],
+            "source": meta.get('source'),
+            "subject_id": meta.get('subject_id'),
+            "hadm_id": meta.get('hadm_id'),
+            "date": meta.get('date'),
+            "text_snippet": r['text'][:500]
+        })
+    pd.DataFrame(rows).to_csv(fname, index=False)
+    with open(os.path.join(out_dir, f"answer_{qlabel}.txt"), "w", encoding="utf-8") as f:
+        f.write(result['answer'])
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    print("📥 Loading data ...")
+    mimic_df = load_mimic_notes(MIMIC_CSV)
+    pubmed_docs_raw = load_pubmed_abstracts(PUBMED_FILE)
+    mimic_docs, mimic_metas = collect_mimic_documents(mimic_df)
+    pubmed_docs, pubmed_metas = collect_pubmed_documents(pubmed_docs_raw)
+    print(f" - MIMIC docs: {len(mimic_docs)}")
+    print(f" - PubMed docs: {len(pubmed_docs)}")
+
+    print("🧠 Loading models ...")
+    text_model = SentenceTransformer(PRIMARY_MODEL)
+    clip_tokenizer = CLIPTokenizer.from_pretrained(CLIP_MODEL_NAME)
+    clip_model = CLIPTextModel.from_pretrained(CLIP_MODEL_NAME)
+
+    print("📡 Building FAISS indices ...")
+    mimic_index, _ = build_index_for_collection(text_model, clip_tokenizer, clip_model, mimic_docs)
+    pubmed_index, _ = build_index_for_collection(text_model, clip_tokenizer, clip_model, pubmed_docs)
+    print("✅ Indices ready.")
+    
+    for qlabel in QUERIES.keys():
+        print("\n" + "="*100)
+        print(f"🔁 Query: {qlabel}")
+
+        mimic_result = agentic_rag_loop(
+            qlabel, qlabel, mimic_index, mimic_docs, mimic_metas,
+            text_model, clip_tokenizer, clip_model
+        )
+        pubmed_result = agentic_rag_loop(
+            qlabel, qlabel, pubmed_index, pubmed_docs, pubmed_metas,
+            text_model, clip_tokenizer, clip_model
+        )
+
+        # Save results
+        save_results_to_csv(mimic_result, os.path.join(OUTPUT_DIR, "mimic"))
+        save_results_to_csv(pubmed_result, os.path.join(OUTPUT_DIR, "pubmed"))
+
+        # --- Side-by-side comparison ---
+        print("\n📊 COMPARISON TABLE")
+        print(f"{'Source':<10} | {'Mean Score':<10} | {'Best Score':<10} | {'Unique Docs':<12} | {'Answer (truncated)':<60}")
+        print("-"*120)
+
+        for label, res in [("MIMIC", mimic_result), ("PubMed", pubmed_result)]:
+            m = res['metrics']
+            ans = res['answer'].replace("\n", " ")[:55] + ("..." if len(res['answer']) > 55 else "")
+            print(f"{label:<10} | {m['mean_score']:<10.3f} | {m['best_score']:<10.3f} | {m['unique_docs']:<12} | {ans:<60}")
+
+
+if __name__ == "__main__":
+    main()
+
