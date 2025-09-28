@@ -1,6 +1,4 @@
 #eval_rag_qa.py
-
-#!/usr/bin/env python3
 # Ema's addition
 """
 Evaluate Biomedical RAG on QA datasets (BIOSQ / PubMedQA / generic CSV/JSONL).
@@ -17,22 +15,22 @@ Notes:
  - Supports CSV/TSV/JSONL inputs for QA and corpus (auto-detect by extension).
 """
 
-import argparse
-import json
 import os
-import math
-import csv
-from typing import List, Dict, Any, Optional, Tuple
-import pandas as pd
 import re
+import csv
+import json
+import math
+import argparse
+import pandas as pd
 from tqdm import tqdm
+from datasets import load_dataset
+from typing import List, Dict, Any, Optional, Tuple
+from agent.document_store import DocumentStore
+from agent.retrieval import rerank_hybrid
+from agent.generation import answer_with_context, reflect_and_refine
 
-# Import from your project (should be on PYTHONPATH or same folder)
-from document_store import DocumentStore
-from retrieval import rerank_hybrid
-from generation import answer_with_context, reflect_and_refine
 
-# default retrieval params will come from rag_config via rerank_hybrid/store defaults
+dataset = load_dataset("qiaojin/PubMedQA", "pqa_labeled")
 
 # ---------- Text normalization & SQuAD-like metrics ----------
 def normalize_answer(s: str) -> str:
@@ -222,20 +220,20 @@ def evaluate(
 
 # ---------- CLI ----------
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--corpus", required=True, help="Path to corpus CSV/TSV/JSONL used to build index")
-    p.add_argument("--corpus_text_col", default="TEXT", help="column in corpus with textual content")
-    p.add_argument("--corpus_context_col", default="CONTEXT", help="optional column with context/metadata")
-    p.add_argument("--corpus_id_col", default="DOC_ID", help="optional unique id column for corpus rows")
-    p.add_argument("--qa", required=True, help="QA dataset file (CSV/TSV/JSONL)")
-    p.add_argument("--qa_q_col", default="question", help="QA dataset question column")
-    p.add_argument("--qa_a_col", default="answer", help="QA dataset answer column")
-    p.add_argument("--out", default="eval_results.csv", help="output CSV for predictions + metrics")
-    p.add_argument("--max_examples", type=int, default=None, help="limit number of QA examples for quick tests")
-    p.add_argument("--reflect", action="store_true", help="run reflect_and_refine after initial generation")
-    p.add_argument("--top_k", type=int, default=None, help="override top_k candidates from FAISS (optional)")
-    p.add_argument("--final_k", type=int, default=None, help="override final_k MMR selection (optional)")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corpus", required=True, help="Path to corpus CSV/TSV/JSONL used to build index")
+    parser.add_argument("--corpus_text_col", default="TEXT", help="column in corpus with textual content")
+    parser.add_argument("--corpus_context_col", default="CONTEXT", help="optional column with context/metadata")
+    parser.add_argument("--corpus_id_col", default="DOC_ID", help="optional unique id column for corpus rows")
+    parser.add_argument("--qa", required=True, help="QA dataset file (CSV/TSV/JSONL)")
+    parser.add_argument("--qa_q_col", default="question", help="QA dataset question column")
+    parser.add_argument("--qa_a_col", default="answer", help="QA dataset answer column")
+    parser.add_argument("--out", default="eval_results.csv", help="output CSV for predictions + metrics")
+    parser.add_argument("--max_examples", type=int, default=None, help="limit number of QA examples for quick tests")
+    parser.add_argument("--reflect", action="store_true", help="run reflect_and_refine after initial generation")
+    parser.add_argument("--top_k", type=int, default=None, help="override top_k candidates from FAISS (optional)")
+    parser.add_argument("--final_k", type=int, default=None, help="override final_k MMR selection (optional)")
+    args = parser.parse_args()
 
     # read files
     print("[eval] loading corpus:", args.corpus)
@@ -259,6 +257,8 @@ def main():
         out_csv=args.out,
         max_examples=args.max_examples,
     )
+    summary.to_csv("qa_metrics.json")
+    df_out.to_csv("qa_results.csv")
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,13 @@
+tqdm
+numpy
+pandas
+openai
+datasets
+fastapi
+uvicorn
+tiktoken
+faiss-cpu
+transformers
+python-dotenv
+python-multipart
+sentence-transformers

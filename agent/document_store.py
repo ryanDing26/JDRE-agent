@@ -1,22 +1,17 @@
 # document_store.py
-import os, re
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+import os
+import re
+import torch
+import faiss
 import numpy as np
 import pandas as pd
 from functools import lru_cache
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any, Optional
+from sentence_transformers import SentenceTransformer
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-try:
-    import faiss
-    _FAISS_OK = True
-except Exception:
-    faiss = None  # type: ignore
-    _FAISS_OK = False
-
-from sentence_transformers import SentenceTransformer
 
 from rag_config import (
     EMBED_MODEL_NAMES, DEVICE, USE_COSINE,
@@ -24,20 +19,7 @@ from rag_config import (
     CHUNK_SIZE, CHUNK_OVERLAP, MAX_CHUNKS_WARN
 )
 
-def _pick_device(device_arg: str) -> str:
-    if device_arg and device_arg != "auto":
-        return device_arg
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
-    except Exception:
-        pass
-    return "cpu"
-
-_device = _pick_device(DEVICE)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def clean_text(t: str) -> str:
     t = (t or "").replace("\r", "\n")
@@ -84,16 +66,9 @@ class MultiModelIndex:
         self.use_cosine = USE_COSINE
         self._faiss_gpu = False
 
-    def _ensure_faiss(self):
-        if not _FAISS_OK:
-            raise RuntimeError(
-                "faiss is not installed. Install faiss-cpu (or faiss-gpu via conda)."
-            )
-
     def _maybe_gpu_index(self, cpu_index):
         if not FAISS_USE_GPU:
             return cpu_index
-        self._ensure_faiss()
         try:
             res = faiss.StandardGpuResources()
             return faiss.index_cpu_to_gpu(res, FAISS_GPU_ID, cpu_index)
@@ -114,7 +89,6 @@ class MultiModelIndex:
         return embs
 
     def build(self, texts: List[str]):
-        self._ensure_faiss()
         # Build index for each model
         for i, name in enumerate(self.model_names):
             embs = self._encode_model(name, texts)
@@ -177,10 +151,10 @@ class DocumentStore:
     """
     def __init__(self):
         names = [m.strip() for m in EMBED_MODEL_NAMES.split(",") if m.strip()]
-        self.mm: MultiModelIndex = MultiModelIndex(names, _device)
+        self.mm: MultiModelIndex = MultiModelIndex(names, device)
         self.chunks: List[Chunk] = []
         self._id2row: Dict[int, Chunk] = {}
-        self.device = _device
+        self.device = device
 
     def load_from_dataframe(
         self,

@@ -1,9 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[ ]:
-
-
 # retrieval.py
 import re
 from typing import List, Dict, Tuple, Any, Set

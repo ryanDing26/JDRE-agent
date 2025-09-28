@@ -1,13 +1,13 @@
 # app.py
 import io
-from typing import List, Dict, Any
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from schemas import LoadJSONRequest, QueryRequest, QueryResponse, EvidenceItem
-from document_store import DocumentStore
+from typing import List, Dict, Any
 from retrieval import rerank_hybrid
-from generation import answer_with_context, reflect_and_refine
+from document_store import DocumentStore
 from rag_config import CHUNK_SIZE, CHUNK_OVERLAP
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from generation import answer_with_context, reflect_and_refine
+from schemas import LoadJSONRequest, QueryRequest, QueryResponse, EvidenceItem
 
 app = FastAPI(title="Biomedical RAG API", version="1.0.0")
 

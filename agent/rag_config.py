@@ -11,7 +11,7 @@ import os
 
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 # Paste your OpenAI key between the quotes:
-OPENAI_API_KEY = "REPLACE_WITH_YOUR_OPENAI_KEY"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # Chat model (OpenAI) used to synthesize & refine answers
@@ -26,9 +26,6 @@ EMBED_MODEL_NAMES = os.getenv(
     "EMBED_MODEL_NAMES",
     "pritamdeka/S-BioBert-snli-multinli-stsb,cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
 )
-
-# Device selection: "auto" | "cuda" | "mps" | "cpu"
-DEVICE = os.getenv("AGENTIC_DEVICE", "auto")
 
 # Use cosine similarity (recommended for normalized embeddings)
 USE_COSINE = True
