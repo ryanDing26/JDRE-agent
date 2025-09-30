@@ -1,16 +1,7 @@
-# rag_config.py
-"""
-Central config for the Biomedical RAG API.
-
-⚠️ SECURITY WARNING:
-You asked to hardcode your OpenAI API key. Put it in OPENAI_API_KEY below.
-Do NOT commit your real key to any public repo.
-In production, prefer environment variables or a secret manager.
-"""
 import os
 
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# Paste your OpenAI key between the quotes:
+# Paste your OpenAI key between the quotes (please don't - Ryan):
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
@@ -39,18 +30,27 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))      # characters per chunk
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200")) # overlapping characters
 
 # Retrieval knobs
-TOP_K = int(os.getenv("TOP_K", "12"))                  # candidates per model from FAISS
-FINAL_K = int(os.getenv("FINAL_K", "5"))               # final snippets after re-rank/MMR
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "96"))
+# TOP_K = int(os.getenv("TOP_K", "12"))                  # candidates per model from FAISS
+# FINAL_K = int(os.getenv("FINAL_K", "5"))               # final snippets after re-rank/MMR
+# EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "96"))
+TOP_K = 12
+FINAL_K = 5
+EMBED_BATCH_SIZE = 96 # TODO make it based on available number of workers
 
 # Hybrid scoring weights
-ALPHA_EMBED = float(os.getenv("ALPHA_EMBED", "0.72"))   # embedding similarity weight
-BETA_KEYWORD = float(os.getenv("BETA_KEYWORD", "0.23")) # keyword/phrase overlap weight
-GAMMA_PHRASE = float(os.getenv("GAMMA_PHRASE", "0.12")) # exact phrase bonus
-DELTA_OFFTOPIC = float(os.getenv("DELTA_OFFTOPIC", "0.25")) # off-topic penalty
+# ALPHA_EMBED = float(os.getenv("ALPHA_EMBED", "0.72"))   # embedding similarity weight
+# BETA_KEYWORD = float(os.getenv("BETA_KEYWORD", "0.23")) # keyword/phrase overlap weight
+# GAMMA_PHRASE = float(os.getenv("GAMMA_PHRASE", "0.12")) # exact phrase bonus
+# DELTA_OFFTOPIC = float(os.getenv("DELTA_OFFTOPIC", "0.25")) # off-topic penalty
+
+ALPHA_EMBED = 0.72
+BETA_KEYWORD = 0.23
+GAMMA_PHRASE = 0.12
+DELTA_OFFTOPIC = 0.25
 
 # MMR
 MMR_LAMBDA = float(os.getenv("MMR_LAMBDA", "0.7"))     # 1.0 = relevance only, 0.0 = diversity
+MMR_LAMBDA = 0.7
 
 # Index cap (safety for accidental huge loads)
 MAX_CHUNKS_WARN = int(os.getenv("MAX_CHUNKS_WARN", "300000"))

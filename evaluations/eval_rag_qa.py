@@ -46,6 +46,7 @@ def normalize_answer(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+# Can implement with ROUGE package -Ryan
 def f1_score(pred: str, gold: str) -> float:
     pred_toks = normalize_answer(pred).split()
     gold_toks = normalize_answer(gold).split()
